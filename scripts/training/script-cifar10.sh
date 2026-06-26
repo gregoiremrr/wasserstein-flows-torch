@@ -13,15 +13,16 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # snapshot (see script-mae-cifar10.sh) passed via --mae-pkl.
 torchrun --standalone --nproc_per_node=4 train.py \
     --outdir=training-runs/cifar10 \
-    --data=datasets/cifar10.zip \
+    --data=../datasets/cifar10.zip \
     --mae-pkl=training-runs/cifar10-mae/<run-dir>/model-snapshot-<latest>.pkl \
     --preset=wflow-cifar10 \
     --no-fp16 \
-    --status=1Mi \
-    --snapshot=8Mi \
-    --checkpoint=32Mi \
-    --metrics=8Mi \
-    --metric-names=fid \
-    --metric-num-samples=10000 \
-    --metric-ref=fid-refs/cifar10.pkl \
-    --metric-batch-size=512
+    --status=1000 \
+    --snapshot=10000 \
+    --checkpoint=30000 \
+    --metrics=10000 \
+    --metric-names=fid,fd_dinov2,mind,mind_dinov2 \
+    --metric-num-samples=20000 \
+    --mind-num-samples=5000 \
+    --metric-ref=../fid-refs/cifar10.pkl \
+    --metric-batch-size=32

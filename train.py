@@ -210,13 +210,14 @@ def setup_training_config(preset='wflow-cifar10', **opts):
     c.cudnn_benchmark = opts.bench
     c.force_finite = opts.force_finite
 
-    # I/O.
-    c.status_nimg = opts.status or None
-    c.snapshot_nimg = opts.snapshot or None
-    c.checkpoint_nimg = opts.checkpoint or None
+    # I/O intervals are specified in optimizer steps; the training loop works in
+    # image counts, so convert here (1 step == batch_size images).
+    c.status_nimg = opts.status * batch_size if opts.status else None
+    c.snapshot_nimg = opts.snapshot * batch_size if opts.snapshot else None
+    c.checkpoint_nimg = opts.checkpoint * batch_size if opts.checkpoint else None
 
-    # Metrics.
-    c.metrics_nimg = opts.metrics or None
+    # Metrics. (Interval is given in optimizer steps.)
+    c.metrics_nimg = opts.metrics * batch_size if opts.metrics else None
     if c.metrics_nimg is not None:
         if not opts.metric_ref:
             raise click.ClickException('--metrics requires --metric-ref')
@@ -263,7 +264,7 @@ def launch_training(run_dir, c):
 
 #----------------------------------------------------------------------------
 
-def parse_nimg(s):
+def parse_count(s):
     if isinstance(s, int):
         return s
     if s.endswith('Ki'):
@@ -303,11 +304,11 @@ def parse_nimg(s):
 @click.option('--bench',            help='cuDNN benchmarking', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--force-finite',     help='Zero NaN/Inf gradients', metavar='BOOL', type=bool, default=True, show_default=True)
 
-@click.option('--status',           help='Status print interval', metavar='NIMG', type=parse_nimg, default='1Mi', show_default=True)
-@click.option('--snapshot',         help='Snapshot interval', metavar='NIMG', type=parse_nimg, default='32Mi', show_default=True)
-@click.option('--checkpoint',       help='Checkpoint interval', metavar='NIMG', type=parse_nimg, default='128Mi', show_default=True)
+@click.option('--status',           help='Interval of status prints (optimizer steps)', metavar='STEPS', type=parse_count, default='512', show_default=True)
+@click.option('--snapshot',         help='Interval of model snapshots (optimizer steps)', metavar='STEPS', type=parse_count, default='32Ki', show_default=True)
+@click.option('--checkpoint',       help='Interval of training checkpoints (optimizer steps)', metavar='STEPS', type=parse_count, default='512Ki', show_default=True)
 
-@click.option('--metrics',          help='FID interval (disabled by default)', metavar='NIMG', type=parse_nimg, default=None, show_default=True)
+@click.option('--metrics',          help='Interval of FID/FD-DINOv2/MIND evaluation (optimizer steps). Disabled by default.', metavar='STEPS', type=parse_count, default=None, show_default=True)
 @click.option('--metric-names',     help='Metrics to compute', metavar='LIST', type=str, default='fid', show_default=True)
 @click.option('--metric-num-samples', help='# samples for Frechet metrics', metavar='INT', type=click.IntRange(min=2), default=10000, show_default=True)
 @click.option('--mind-num-samples', help='# samples for MIND metrics', metavar='INT', type=click.IntRange(min=2), default=5000, show_default=True)

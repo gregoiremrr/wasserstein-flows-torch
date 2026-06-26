@@ -131,15 +131,16 @@ def setup_training_config(preset='mae-cifar10', **opts):
     c.loss_scaling = opts.ls
     c.cudnn_benchmark = opts.bench
     c.force_finite = opts.force_finite
-    c.status_nimg = opts.status or None
-    c.snapshot_nimg = opts.snapshot or None
-    c.checkpoint_nimg = opts.checkpoint or None
+    # I/O intervals are specified in optimizer steps; convert to image counts.
+    c.status_nimg = opts.status * batch_size if opts.status else None
+    c.snapshot_nimg = opts.snapshot * batch_size if opts.snapshot else None
+    c.checkpoint_nimg = opts.checkpoint * batch_size if opts.checkpoint else None
     c.seed = opts.seed
     return c
 
 #----------------------------------------------------------------------------
 
-def parse_nimg(s):
+def parse_count(s):
     if isinstance(s, int):
         return s
     for suf, sh in (('Ki', 10), ('Mi', 20), ('Gi', 30)):
@@ -168,9 +169,9 @@ def parse_nimg(s):
 @click.option('--bench',            help='cuDNN benchmarking', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--force-finite',     help='Zero NaN/Inf gradients', metavar='BOOL', type=bool, default=True, show_default=True)
 
-@click.option('--status',           help='Status print interval', metavar='NIMG', type=parse_nimg, default='1Mi', show_default=True)
-@click.option('--snapshot',         help='Snapshot interval', metavar='NIMG', type=parse_nimg, default='16Mi', show_default=True)
-@click.option('--checkpoint',       help='Checkpoint interval', metavar='NIMG', type=parse_nimg, default='64Mi', show_default=True)
+@click.option('--status',           help='Interval of status prints (optimizer steps)', metavar='STEPS', type=parse_count, default='512', show_default=True)
+@click.option('--snapshot',         help='Interval of model snapshots (optimizer steps)', metavar='STEPS', type=parse_count, default='16Ki', show_default=True)
+@click.option('--checkpoint',       help='Interval of training checkpoints (optimizer steps)', metavar='STEPS', type=parse_count, default='64Ki', show_default=True)
 @click.option('--seed',             help='Random seed', metavar='INT', type=int, default=0, show_default=True)
 @click.option('-n', '--dry-run',    help='Print config and exit', is_flag=True)
 def cmdline(outdir, dry_run, **opts):

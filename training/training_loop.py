@@ -110,6 +110,22 @@ def training_loop(
         assert metrics_kwargs is not None and metrics_kwargs.get('ref_path'), \
             '--metrics requires --metric-ref to be set'
 
+    # Report the batch composition (mirrors the base repo). The drift loss treats
+    # each class label as an independent group, so per-rank gradient accumulation
+    # is over chunks of `loss_microbatch_labels` labels rather than image
+    # micro-batches.
+    world_size = dist.get_world_size()
+    assert batch_size % (labels_per_step * world_size) == 0, \
+        'batch_size must equal labels_per_step * gen_per_label * world_size'
+    batch_gpu_total = batch_size // world_size
+    gen_per_label = batch_gpu_total // labels_per_step
+    mb_labels = loss_microbatch_labels if (loss_microbatch_labels and loss_microbatch_labels > 0) else labels_per_step
+    num_accumulation_rounds = (labels_per_step + mb_labels - 1) // mb_labels
+    dist.print0(f'Batch size: total {batch_size}, per-GPU {batch_gpu_total} '
+                f'(micro-batch {mb_labels * gen_per_label} x {num_accumulation_rounds} accumulation rounds, '
+                f'{mb_labels}/{labels_per_step} labels per chunk), '
+                f'GPUs {world_size}')
+
     # Dataset and encoder.
     dist.print0('Loading dataset...')
     dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
@@ -196,6 +212,7 @@ def training_loop(
                 'maintenance',  f"{training_stats.report0('Timing/maintenance_sec',                     cur_time - prev_status_time - cumulative_training_time):<7.2f}",
                 'cpumem',       f"{training_stats.report0('Resources/cpu_mem_gb',                       cpu_memory_usage / 2**30):<6.2f}",
                 'gpumem',       f"{training_stats.report0('Resources/peak_gpu_mem_gb',                  torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}",
+                'reserved',     f"{training_stats.report0('Resources/peak_gpu_mem_reserved_gb',         torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}",
                 'loss',         f"{step_stats.get('loss', float('nan')):<6.4f}",
             ]))
             sec_per_tick = cur_time - prev_status_time

@@ -13,6 +13,12 @@ torchrun --standalone --nproc_per_node=4 train.py \
     --mae-pkl=training-runs/cifar10-mae/<run-dir>/model-snapshot-<latest>.pkl \
     --preset=wflow-cifar10 \
     --no-fp16 \
-    --status=1Mi \
-    --snapshot=8Mi \
-    --checkpoint=32Mi
+    --status=1000 \
+    --snapshot=10000 \
+    --checkpoint=30000 \
+    --metrics=10000 \
+    --metric-names=fid,fd_dinov2,mind,mind_dinov2 \
+    --metric-num-samples=20000 \
+    --mind-num-samples=5000 \
+    --metric-ref=../fid-refs/cifar10.pkl \
+    --metric-batch-size=32
