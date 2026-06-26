@@ -81,7 +81,7 @@ _common_cifar = dict(
     use_quadratic_cost=True,
     disable_diag_mask=True,  # Two-batch self-transport => no diagonal masking.
     lr=2e-4,
-    warmup_steps=5_000,
+    warmup_steps=1_000,
     weight_decay=0.01,
     max_clip_norm=2.0,
     adam_betas=(0.9, 0.95),
@@ -90,7 +90,7 @@ _common_cifar = dict(
 config_presets = {
     'wflow-cifar10': dnnlib.EasyDict(
         **_common_cifar,
-        total_steps=50_000,
+        total_steps=10_000,
         labels_per_step=8,        # Nc per rank
         gen_per_label=64,         # generated samples per label (main batch)
         self_gen_per_label=64,    # second (independent) generated batch for self-transport

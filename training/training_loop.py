@@ -300,7 +300,7 @@ def training_loop(
                 prev_status_time = time.time()
 
         # ---- Save snapshot. ----
-        if snapshot_nimg is not None and state.cur_nimg % snapshot_nimg == 0 and (state.cur_nimg != start_nimg or start_nimg == 0) and dist.get_rank() == 0:
+        if snapshot_nimg is not None and state.cur_nimg % snapshot_nimg == 0 and state.cur_nimg != start_nimg and dist.get_rank() == 0:
             ema_list = ema.get() if ema is not None else model
             ema_list = ema_list if isinstance(ema_list, list) else [(ema_list, '')]
             for ema_model, ema_suffix in ema_list:
