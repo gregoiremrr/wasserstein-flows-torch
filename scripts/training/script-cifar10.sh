@@ -9,12 +9,15 @@ export NCCL_IB_DISABLE=1
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+#MAE_PKL=../drifting-models-torch/training-runs/cifar10-mae/260605_155827_mae-cifar10/model-snapshot-0050331.pkl
+MAE_PKL=../model-snapshot-0050331.pkl
+
 # Train the one-step W-Flow generator. Requires a pretrained ResNet-MAE
 # snapshot (see script-mae-cifar10.sh) passed via --mae-pkl.
 torchrun --standalone --nproc_per_node=4 train.py \
     --outdir=training-runs/cifar10 \
     --data=../datasets/cifar10.zip \
-    --mae-pkl=../drifting-models-torch/training-runs/cifar10-mae/260605_155827_mae-cifar10/model-snapshot-0050331.pkl \
+    --mae-pkl=${MAE_PKL} \
     --preset=wflow-cifar10 \
     --no-fp16 \
     --status=100 \
@@ -25,4 +28,4 @@ torchrun --standalone --nproc_per_node=4 train.py \
     --metric-num-samples=20000 \
     --mind-num-samples=5000 \
     --metric-ref=../fid-refs/cifar10.pkl \
-    --metric-batch-size=32
+    --metric-batch-size=512
