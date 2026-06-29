@@ -103,7 +103,7 @@ config_presets = {
         negative_bank_size=128,  # ~16-step neg-pool memory at push_per_step=8 (matches paper horizon).
         push_per_step=8,         # = labels_per_step (paper invariant); per-class pos horizon ~160 steps.
         push_at_resume=8,
-        loss_microbatch_labels=1,
+        loss_microbatch_labels=2,
     ),
     # Tiny preset for smoke tests / single-GPU debugging.
     'wflow-cifar10-debug': dnnlib.EasyDict(
