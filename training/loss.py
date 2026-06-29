@@ -37,7 +37,7 @@ class DriftLoss:
         cfg_max=4.0,
         neg_cfg_pw=1.0,
         no_cfg_frac=0.0,
-        R_list=(0.05,),             # Entropic-regularisation eps values (single value by default).
+        R_list=(0.02, 0.05, 0.2),   # Entropic-reg eps values (multi-scale; matches reference).
         sinkhorn_num_iter=10,
         use_quadratic_cost=True,
         disable_diag_mask=True,
@@ -95,7 +95,7 @@ class DriftLoss:
 
     # -- main call -----------------------------------------------------------
 
-    def __call__(self, model, feature_encoder, labels, pos_images, uncond_images, cfg):
+    def __call__(self, model, feature_encoder, labels, pos_images, uncond_images, cfg, self_images=None):
         """
         Args:
             model: generator (possibly DDP-wrapped); ``model(class_idx, cfg)`` -> images.
@@ -104,6 +104,10 @@ class DriftLoss:
             pos_images: [Nc, n_pos, C, H, W] positive reals.
             uncond_images: [Nc, n_uncond, C, H, W] unconditional reals (velocity-CFG).
             cfg: [Nc] per-label CFG scale alpha = w + 1.
+            self_images: optional [Nc, gs', C, H, W] cached past-generated samples to
+                use as the self-transport batch q' (the biased ``--use-old-neg`` mode).
+                When None (default), a fresh independent second batch is generated
+                from the current generator -> the unbiased two-batch estimator.
         """
         Nc, n_pos = pos_images.shape[0], pos_images.shape[1]
         n_uncond = uncond_images.shape[1]
@@ -126,17 +130,26 @@ class DriftLoss:
         gen_feats = self._features(feature_encoder, gen_images)
         gen_feats = {k: v.reshape(Nc, g, *v.shape[1:]) for k, v in gen_feats.items()}
 
-        # Second, independent generated batch (stop-gradient) for the debiased
-        # self-transport term T^eps_{q,q'} (two-batch estimator).
+        # Second generated batch (stop-gradient) for the self-transport term
+        # T^eps_{q,q'}. Unbiased mode draws a fresh independent batch from the
+        # CURRENT generator; ``--use-old-neg`` instead reuses cached past generations
+        # (q' from a previous step) -> cheaper (no extra forward) but biased/stale.
         with torch.no_grad():
-            self_class_idx = labels.repeat_interleave(gs)
-            self_cfg_rep = cfg.repeat_interleave(gs)
-            self_images = model(self_class_idx, self_cfg_rep)
-            self_feats = self._features(feature_encoder, self_images)
-            self_feats = {k: v.reshape(Nc, gs, *v.shape[1:]) for k, v in self_feats.items()}
+            if self_images is None:
+                self_class_idx = labels.repeat_interleave(gs)
+                self_cfg_rep = cfg.repeat_interleave(gs)
+                self_imgs = model(self_class_idx, self_cfg_rep)
+                gs_eff = gs
+            else:
+                gs_eff = self_images.shape[1]
+                self_imgs = self_images.reshape(Nc * gs_eff, *self_images.shape[2:])
+            self_feats = self._features(feature_encoder, self_imgs)
+            self_feats = {k: v.reshape(Nc, gs_eff, *v.shape[1:]) for k, v in self_feats.items()}
 
         total_loss = gen_images.new_zeros(())
         stats = {}
+        scale_sum = gen_images.new_zeros(())
+        force_sum = gen_images.new_zeros(())
         for key, gen_f in gen_feats.items():
             real = real_feats[key]                       # [Nc, n_real_block, T, D]
             pos_f = real[:, :n_pos]
@@ -162,8 +175,24 @@ class DriftLoss:
             )
             total_loss = total_loss + loss_k.mean()
             stats[f'drift/{key}'] = loss_k.mean().detach()
+            # info_k['scale'] = feature magnitude; info_k['loss_{R}'] = raw
+            # (pre-normalization) drift force at that eps. Averaged across
+            # features these are informative monitoring signals (unlike the
+            # near-constant total loss).
+            if 'scale' in info_k:
+                scale_sum = scale_sum + info_k['scale'].detach()
+            force_keys = [k for k in info_k if k.startswith('loss_')]
+            if force_keys:
+                force_sum = force_sum + sum(info_k[k].detach() for k in force_keys) / len(force_keys)
 
+        # Average (not sum) the per-feature drift losses, matching the official
+        # W-Flow training step (`train.py`: chunk_loss /= len(chunk_sg)). Summing
+        # over the dozens of MAE feature heads would scale the loss -- and hence
+        # the generator gradients -- by ~#features relative to the reference.
+        n_feat = max(len(gen_feats), 1)
+        total_loss = total_loss / n_feat
         out_stats = dict(loss=total_loss.detach(), cfg=cfg.mean().detach(),
+                         drift_scale=(scale_sum / n_feat), drift_force=(force_sum / n_feat),
                          gen_images=gen_images.detach(), gen_labels=class_idx.detach())
         return total_loss, out_stats
 

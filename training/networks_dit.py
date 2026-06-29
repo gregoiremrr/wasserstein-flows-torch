@@ -261,8 +261,10 @@ class LightningDiT(nn.Module):
         # Patch embedding (linear on flattened patches).
         patch_dim = patch_size * patch_size * in_channels
         self.patch_embed = nn.Linear(patch_dim, hidden_size, bias=True)
+        # Learnable positional embedding, sincos-initialized (matches the official
+        # repo, which trains pos_embed as an nn.Parameter rather than freezing it).
         pos = get_2d_sincos_pos_embed(hidden_size, grid)
-        self.register_buffer('pos_embed', torch.from_numpy(pos).float()[None], persistent=False)
+        self.pos_embed = nn.Parameter(torch.from_numpy(pos).float()[None])
 
         # Register tokens.
         if n_cls_tokens > 0:
@@ -288,6 +290,29 @@ class LightningDiT(nn.Module):
             for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, out_channels, cond_dim, use_rmsnorm=use_rmsnorm)
+
+        self._init_weights()
+
+    # -- weight init ---------------------------------------------------------
+
+    def _init_weights(self):
+        # Xavier-uniform on every Linear (weights) with zero bias, matching the
+        # official repo's TorchLinear default. Embeddings keep their normal(0,0.02)
+        # init; RMSNorm scales stay at 1. The adaLN modulation and the final
+        # projection are then re-zeroed (adaLN-zero: blocks start as identity).
+        def _xavier(m):
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        self.apply(_xavier)
+        for block in self.blocks:
+            nn.init.zeros_(block.adaLN.weight)
+            nn.init.zeros_(block.adaLN.bias)
+        nn.init.zeros_(self.final_layer.adaLN.weight)
+        nn.init.zeros_(self.final_layer.adaLN.bias)
+        nn.init.zeros_(self.final_layer.linear.weight)
+        nn.init.zeros_(self.final_layer.linear.bias)
 
     # -- conditioning --------------------------------------------------------
 
@@ -321,7 +346,8 @@ class LightningDiT(nn.Module):
 
     def forward(self, noise, cond):
         """noise: [B, C, H, W] Gaussian. cond: [B, cond_dim]. Returns [B, out, H, W]."""
-        x = self.patch_embed(self.patchify(noise)) + self.pos_embed.to(noise.dtype)
+        x = self.patch_embed(self.patchify(noise))
+        x = x + self.pos_embed.to(x.dtype)
         if self.n_cls_tokens > 0:
             c_tokens = self.cls_proj(cond).unsqueeze(1).expand(-1, self.n_cls_tokens, -1)
             c_tokens = c_tokens + self.cls_embed

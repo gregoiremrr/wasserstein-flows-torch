@@ -76,12 +76,15 @@ _common_cifar = dict(
     neg_cfg_pw=3.0,        # p(alpha) ~ alpha^-3.
     no_cfg_frac=0.0,
     # Sinkhorn (debiased entropic-OT) drift knobs.
-    R_list=[0.05],         # Entropic-regularisation eps (single value; W-Flow is robust to it).
-    sinkhorn_num_iter=10,
+    R_list=[0.05],         # Entropic-reg eps. SOTA OT configs (W-Flow latent_sota_*_ot, ablation_ot)
+                           # all use a single eps of 0.05. (The multi-eps [0.02,0.05,0.2] list comes
+                           # from the *Drifting* non-OT ablation, not from any W-Flow OT recipe.)
+    sinkhorn_num_iter=10,  # SOTA OT setting (B/XL configs use 10; the L config uses 1).
     use_quadratic_cost=True,
     disable_diag_mask=True,  # Two-batch self-transport => no diagonal masking.
+    use_old_neg=False,     # False = unbiased fresh second batch; True = cached previous-step generations as q'.
     lr=2e-4,
-    warmup_steps=1_000,
+    warmup_steps=3_000,
     weight_decay=0.01,
     max_clip_norm=2.0,
     adam_betas=(0.9, 0.95),
@@ -90,17 +93,17 @@ _common_cifar = dict(
 config_presets = {
     'wflow-cifar10': dnnlib.EasyDict(
         **_common_cifar,
-        total_steps=10_000,
+        total_steps=50_000,
         labels_per_step=8,        # Nc per rank
         gen_per_label=64,         # generated samples per label (main batch)
         self_gen_per_label=64,    # second (independent) generated batch for self-transport
         pos_per_sample=256,       # real positives per label
         neg_per_sample=64,        # unconditional reals per label (velocity-CFG)
-        positive_bank_size=1024,
-        negative_bank_size=1000,
-        push_per_step=256,
+        positive_bank_size=128,
+        negative_bank_size=128,  # ~16-step neg-pool memory at push_per_step=8 (matches paper horizon).
+        push_per_step=8,         # = labels_per_step (paper invariant); per-class pos horizon ~160 steps.
         push_at_resume=8,
-        loss_microbatch_labels=2,
+        loss_microbatch_labels=1,
     ),
     # Tiny preset for smoke tests / single-GPU debugging.
     'wflow-cifar10-debug': dnnlib.EasyDict(
@@ -168,7 +171,7 @@ def setup_training_config(preset='wflow-cifar10', **opts):
         raise click.ClickException(f'--data: expected 3-channel pixel data, got {dataset_channels}')
 
     # Model.
-    c.model_kwargs = dnnlib.EasyDict(class_name='training.model.DriftingModel', use_fp16=opts.fp16, **opts.net_kwargs)
+    c.model_kwargs = dnnlib.EasyDict(class_name='training.model.DriftingModel', use_fp16=opts.fp16, use_bf16=opts.bf16, **opts.net_kwargs)
 
     # Loss (Sinkhorn debiased entropic-OT drift).
     c.loss_kwargs = dnnlib.EasyDict(
@@ -204,6 +207,10 @@ def setup_training_config(preset='wflow-cifar10', **opts):
     c.push_at_resume = opts.push_at_resume
     c.total_nimg = total_nimg
     c.mae_pkl = opts.mae_pkl
+
+    # Self-transport q' source: cached past generations (biased) vs fresh batch (unbiased).
+    c.use_old_neg = bool(opts.use_old_neg)
+    c.old_bank_size = opts.old_bank_size if opts.old_bank_size else opts.self_gen_per_label
 
     # Performance.
     c.loss_scaling = opts.ls
@@ -290,6 +297,8 @@ def parse_count(s):
 @click.option('--pos-per-sample',   help='Positive samples per label (Npos)', metavar='INT', type=int, default=None)
 @click.option('--neg-per-sample',   help='Unconditional reals per label (velocity-CFG)', metavar='INT', type=int, default=None)
 @click.option('--loss-microbatch-labels', help='Process Nc labels in chunks of this size (grad accumulation) to cap VRAM; 0/unset = no split', metavar='INT', type=int, default=None)
+@click.option('--use-old-neg/--no-use-old-neg', help="Self-transport q': reuse cached previous-step generations (biased, no extra forward) vs a fresh independent batch (unbiased)", default=None)
+@click.option('--old-bank-size',    help='Per-class cache size for --use-old-neg (default: self_gen_per_label)', metavar='INT', type=int, default=None)
 @click.option('--eps',              help='Sinkhorn entropic-regularisation value (overrides single-value R_list)', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=None)
 @click.option('--sinkhorn-num-iter', help='Sinkhorn-Knopp iterations per OT problem', metavar='INT', type=click.IntRange(min=1), default=None)
 @click.option('--lr',               help='Learning rate', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=None)
@@ -299,7 +308,8 @@ def parse_count(s):
 @click.option('--pin-memory',       help='Pinned dataloader memory', metavar='BOOL', default=True, show_default=True)
 @click.option('--num-workers',      help='Dataloader workers', metavar='INT', type=int, default=2, show_default=True)
 @click.option('--prefetch_factor',  help='Dataloader prefetch', metavar='INT', type=int, default=2, show_default=True)
-@click.option('--fp16/--no-fp16',   help='Mixed-precision generator', metavar='BOOL', default=False, show_default=True)
+@click.option('--fp16/--no-fp16',   help='fp16 mixed-precision generator (legacy, needs loss scaling)', metavar='BOOL', default=False, show_default=True)
+@click.option('--bf16/--no-bf16',   help='bf16 autocast generator (matmuls in bf16, norms/attn/loss stay fp32)', metavar='BOOL', default=True, show_default=True)
 @click.option('--ls',               help='Loss scaling', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=1, show_default=True)
 @click.option('--bench',            help='cuDNN benchmarking', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--force-finite',     help='Zero NaN/Inf gradients', metavar='BOOL', type=bool, default=True, show_default=True)

@@ -35,6 +35,7 @@ class DriftingModel(torch.nn.Module):
         use_rmsnorm=True,
         attn_fp32=True,
         use_fp16=False,
+        use_bf16=False,
     ):
         super().__init__()
         self.img_resolution = img_resolution
@@ -44,6 +45,7 @@ class DriftingModel(torch.nn.Module):
         self.noise_classes = noise_classes
         self.noise_coords = noise_coords
         self.use_fp16 = use_fp16
+        self.use_bf16 = use_bf16
         cond_dim = cond_dim if cond_dim is not None else hidden_size
 
         self.net = LightningDiT(
@@ -83,8 +85,16 @@ class DriftingModel(torch.nn.Module):
         if style_idx is None and self.noise_classes > 0 and self.noise_coords > 0:
             style_idx = torch.randint(0, self.noise_classes, (B, self.noise_coords),
                                       device=device, generator=generator)
-        cond = self.net.make_cond(class_idx, cfg_scale, style_idx)
-        return self.net(noise, cond)
+        # Mixed precision: run the transformer matmuls in bf16 (autocast) for
+        # speed/memory; the sensitive parts stay fp32 -- RMSNorm/QK-norm upcast
+        # internally, attention runs fp32 when attn_fp32=True, and the bf16 output
+        # is cast back to fp32 so the (fp32) feature encoder + Sinkhorn loss are
+        # unaffected.
+        use_amp = self.use_bf16 and device.type == 'cuda'
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
+            cond = self.net.make_cond(class_idx, cfg_scale, style_idx)
+            out = self.net(noise, cond)
+        return out.float() if use_amp else out
 
     def forward(self, class_idx, cfg_scale=1.0, noise=None, style_idx=None):
         return self.generate(class_idx, cfg_scale=cfg_scale, noise=noise, style_idx=style_idx)

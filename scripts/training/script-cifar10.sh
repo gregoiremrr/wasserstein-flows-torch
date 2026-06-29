@@ -17,10 +17,10 @@ torchrun --standalone --nproc_per_node=4 train.py \
     --mae-pkl=../drifting-models-torch/training-runs/cifar10-mae/260605_155827_mae-cifar10/model-snapshot-0050331.pkl \
     --preset=wflow-cifar10 \
     --no-fp16 \
-    --status=10 \
-    --snapshot=300 \
-    --checkpoint=600 \
-    --metrics=300 \
+    --status=100 \
+    --snapshot=1000 \
+    --checkpoint=3000 \
+    --metrics=1000 \
     --metric-names=fid,fd_dinov2,mind,mind_dinov2 \
     --metric-num-samples=20000 \
     --mind-num-samples=5000 \

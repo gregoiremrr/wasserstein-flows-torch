@@ -72,6 +72,40 @@ def log_to_wandb(
     wandb.log(log_dict)
 
 #----------------------------------------------------------------------------
+# Per-component gradient norms for the generator.
+#
+# The drift loss is a moving, per-step-renormalized target, so its scalar value
+# is almost constant and tells you little about whether the network is actually
+# learning. The gradient *distribution* across components is far more telling:
+#   - `grad/cond`  : class / style / CFG conditioning embeddings. If this stays
+#                    ~0 the generator is ignoring the label (adaLN-zero never
+#                    "woke up" -> samples will never become class-conditional).
+#   - `grad/blocks`, `grad/blocks_adaLN` : the transformer body / its adaLN
+#                    modulation. ~0 means only the readout is training.
+#   - `grad/final`, `grad/patch_embed`   : input / output projections.
+# Call AFTER backward() and BEFORE gradient clipping.
+
+_COND_KEYS = ('class_embed', 'noise_embeds', 'cfg_embedder', 'cfg_norm', 'cls_proj', 'cls_embed')
+
+def grad_norms_by_group(model):
+    groups = {'cond': 0.0, 'patch_embed': 0.0, 'blocks': 0.0, 'blocks_adaLN': 0.0, 'final': 0.0}
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        g2 = p.grad.detach().float().pow(2).sum().item()
+        if any(k in name for k in _COND_KEYS):
+            groups['cond'] += g2
+        elif 'patch_embed' in name:
+            groups['patch_embed'] += g2
+        elif 'final_layer' in name:
+            groups['final'] += g2
+        elif 'blocks' in name:
+            groups['blocks'] += g2
+            if 'adaLN' in name:
+                groups['blocks_adaLN'] += g2
+    return {f'grad/{k}': v ** 0.5 for k, v in groups.items()}
+
+#----------------------------------------------------------------------------
 # Generate a square grid of samples using the sampler from the dataset preset.
 # For class-conditional models the first `label_dim` samples cycle through the
 # classes, the rest are random (seeded by `seed`).

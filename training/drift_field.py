@@ -163,8 +163,16 @@ def drift_loss_ot(
             torch.ones_like(fixed_pos[:, :, 0]),
         ], dim=1)
         dist = cdist(old_gen, targets)
-        weighted_dist = dist * targets_w[:, None, :]
-        scale = weighted_dist.mean() / targets_w.mean()
+        # Match the reference: with a quadratic cost the relevant magnitude is
+        # the RMS distance (sqrt(mean(d^2))), so eps -- which multiplies the
+        # squared cost -- stays order-1; with the linear cost it's the mean
+        # distance. (Numerically close in high dim, but kept consistent.)
+        if use_quadratic_cost:
+            weighted_dist_sq = (dist * dist) * targets_w[:, None, :]
+            scale = (weighted_dist_sq.mean() / targets_w.mean().clamp_min(1e-8)).sqrt()
+        else:
+            weighted_dist = dist * targets_w[:, None, :]
+            scale = weighted_dist.mean() / targets_w.mean().clamp_min(1e-8)
         info['scale'] = scale
         scale_inputs = (scale / (S ** 0.5)).clamp(min=1e-3)
 

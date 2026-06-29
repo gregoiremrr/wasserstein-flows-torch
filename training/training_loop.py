@@ -51,6 +51,23 @@ def _load_feature_encoder(mae_pkl, device):
     fresh = MAEResNet(*mae.init_args, **mae.init_kwargs)
     misc.copy_params_and_buffers(mae, fresh, require_all=True)
     mae = fresh.to(device).eval().requires_grad_(False)
+
+    # Guardrail: the generator is trained THROUGH these features, so they must
+    # be differentiable w.r.t. the input. The MAE was pickled with persistence
+    # (which restores the *save-time* source), and that source had a
+    # ``@torch.no_grad()`` on ``_process_feat`` that silently detached ~85% of
+    # the features. Rebuilding from current source (above) fixes it; assert it
+    # actually took effect so this whole class of bug fails loudly at startup.
+    probe = torch.randn(2, mae.in_channels, 32, 32, device=device, requires_grad=True)
+    probe_feats = mae.get_activations(probe)
+    n_diff = sum(int(v.requires_grad) for v in probe_feats.values())
+    if n_diff != len(probe_feats):
+        raise RuntimeError(
+            f'Feature encoder is not fully differentiable: only {n_diff}/{len(probe_feats)} '
+            f'activations carry gradient. The drift loss trains the generator THROUGH these '
+            f'features, so a stray torch.no_grad()/detach in the MAE source breaks training. '
+            f'Check training.networks_mae (e.g. a @torch.no_grad() on _process_feat / get_activations).')
+    dist.print0(f'Feature encoder OK: {n_diff}/{len(probe_feats)} activations are differentiable.')
     return mae
 
 #----------------------------------------------------------------------------
@@ -91,6 +108,9 @@ def training_loop(
     force_finite,
 
     loss_microbatch_labels=None,   # Split the Nc labels into chunks of this size and accumulate grads. None/0 => no split.
+
+    use_old_neg=False,             # Self-transport q' = cached past generations (biased) instead of a fresh second batch (unbiased).
+    old_bank_size=None,            # Per-class queue size for cached generations when use_old_neg. None => self_gen_per_label.
 ):
     device = torch.device('cuda')
 
@@ -187,6 +207,16 @@ def training_loop(
     bank_pos = ArrayMemoryBank(num_classes=num_classes, max_size=positive_bank_size)
     bank_neg = ArrayMemoryBank(num_classes=1, max_size=negative_bank_size)
 
+    # Optional per-class queue of past-generated samples, reused as the (biased)
+    # self-transport batch q' when use_old_neg=True. Sized to hold ~the last batch per
+    # class by default. Until it fills, the loss falls back to a fresh second batch.
+    if use_old_neg:
+        old_bank_size = old_bank_size if (old_bank_size and old_bank_size > 0) else loss_fn.self_gen_per_label
+        bank_old = ArrayMemoryBank(num_classes=num_classes, max_size=old_bank_size)
+        dist.print0(f'use_old_neg enabled: self-transport q\' drawn from a per-class cache (size={old_bank_size}/class).')
+    else:
+        bank_old = None
+
     prev_status_nimg = state.cur_nimg
     cumulative_training_time = 0
     start_nimg = state.cur_nimg
@@ -250,10 +280,19 @@ def training_loop(
                     'loss': step_stats.get('loss', float('nan')),
                     'lr': step_stats.get('lr', float('nan')),
                     'grad_norm': step_stats.get('grad_norm', float('nan')),
+                    # Per-component grad norms: the real "is it learning?" signal.
+                    # grad/cond ~ 0 => the generator is ignoring the class label.
+                    'grad/cond': step_stats.get('grad/cond', float('nan')),
+                    'grad/blocks': step_stats.get('grad/blocks', float('nan')),
+                    'grad/blocks_adaLN': step_stats.get('grad/blocks_adaLN', float('nan')),
+                    'grad/final': step_stats.get('grad/final', float('nan')),
+                    'grad/patch_embed': step_stats.get('grad/patch_embed', float('nan')),
                 }
                 metrics = {
                     'cfg': step_stats.get('cfg', float('nan')),
                     'clip_coef': step_stats.get('clip_coef', float('nan')),
+                    'drift_scale': step_stats.get('drift_scale', float('nan')),
+                    'drift_force': step_stats.get('drift_force', float('nan')),
                     'sec_per_tick': sec_per_tick,
                     'sec_per_kimg': sec_per_kimg,
                 }
@@ -364,20 +403,39 @@ def training_loop(
         mb = loss_microbatch_labels if (loss_microbatch_labels and loss_microbatch_labels > 0) else Nc
         loss_accum = 0.0
         cfg_accum = 0.0
+        drift_scale_accum = 0.0
+        drift_force_accum = 0.0
+        # Draw the self-transport batch q' from the cache (--use-old-neg) once it has
+        # filled; otherwise the loss generates a fresh second batch (unbiased).
+        use_old_now = use_old_neg and bank_old.ready
+        new_gen_images, new_gen_labels = [], []
         for i in range(0, Nc, mb):
             sl = slice(i, min(i + mb, Nc))
             chunk_w = sel_labels[sl].shape[0] / Nc
             is_last = (i + mb >= Nc)
+            self_old = bank_old.sample(sel[sl], loss_fn.self_gen_per_label).to(device).float() if use_old_now else None
             with misc.ddp_sync(ddp, is_last):
                 chunk_loss, chunk_stats = loss_fn(
                     model=ddp, feature_encoder=feature_encoder,
                     labels=sel_labels[sl], pos_images=pos_images[sl],
                     uncond_images=uncond_images[sl], cfg=cfg[sl],
+                    self_images=self_old,
                 )
                 (chunk_loss * loss_scaling * chunk_w).backward()
             loss_accum += chunk_loss.item() * chunk_w
             cfg_accum += chunk_stats['cfg'].item() * chunk_w
+            drift_scale_accum += float(chunk_stats.get('drift_scale', 0.0)) * chunk_w
+            drift_force_accum += float(chunk_stats.get('drift_force', 0.0)) * chunk_w
+            if use_old_neg:
+                new_gen_images.append(chunk_stats['gen_images'])
+                new_gen_labels.append(chunk_stats['gen_labels'])
         training_stats.report('Loss/loss', loss_accum)
+
+        # Push this step's freshly generated samples into the old-generation cache.
+        if use_old_neg and new_gen_images:
+            gen_np = torch.cat(new_gen_images, dim=0).cpu().numpy()
+            gen_lbl = torch.cat(new_gen_labels, dim=0).cpu().numpy()
+            bank_old.add(gen_np, gen_lbl)
 
         lr = dnnlib.util.call_func_by_name(cur_nimg=state.cur_nimg, batch_size=batch_size, **lr_kwargs)
         training_stats.report('Loss/learning_rate', lr)
@@ -391,6 +449,12 @@ def training_loop(
                 if force_finite:
                     torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0, out=param.grad)
 
+        # Per-component gradient norms (pre-clip). The drift loss value is a
+        # near-constant moving target, so these are the real "is it learning?"
+        # signal -- in particular grad/cond reveals whether the generator is
+        # actually using the class label.
+        grad_groups = monitoring.grad_norms_by_group(model)
+
         clip_norm = max_clip_norm if (max_clip_norm is not None and max_clip_norm > 0) else float('inf')
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
         clip_coef = min(1.0, clip_norm / (grad_norm.item() + 1e-12))
@@ -401,6 +465,15 @@ def training_loop(
         step_stats.grad_norm = grad_norm.item()
         step_stats.clip_coef = clip_coef
         step_stats.cfg = cfg_accum
+        step_stats.drift_scale = drift_scale_accum
+        step_stats.drift_force = drift_force_accum
+        step_stats.update(grad_groups)
+
+        training_stats.report('Loss/grad_norm', grad_norm.item())
+        training_stats.report('Loss/drift_scale', drift_scale_accum)
+        training_stats.report('Loss/drift_force', drift_force_accum)
+        for gk, gv in grad_groups.items():
+            training_stats.report(f'Loss/{gk}', gv)
 
         state.cur_nimg += batch_size
         state.cur_step += 1
